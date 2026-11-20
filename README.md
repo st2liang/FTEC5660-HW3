@@ -171,13 +171,100 @@ companies with the same tools and the same answer key rules, but different
 names and wording, and scores your 3 points only.
 
 ## Homework 3 solution:
-> to students: this is your report, see the homework description.
+
+`CHOSEN_POINTS = [1, 2, 7]`. The agent is in `hw3.py`; the Task 2 reflection is in
+[REFLECTION.md](REFLECTION.md).
 
 ### My 3 points and rules
-> for each point: why you chose it, your PASS rule in one or two sentences, and the evidence it uses. Quote Fisher where it helps.
+
+**Point 1 - Market potential for sales growth.** Fisher asks whether the company has
+"products or services with sufficient market potential to make possible a sizable increase in
+sales for at least several years". I chose it because it is the first filter in the book: a
+company that cannot grow its revenue is unlikely to reward a long-term investor, whatever else
+is good about it. *Rule:* PASS when FY2025 revenue (the sum of `orders.amount` in 2025) grew
+from FY2023 to FY2025 by at least the median firm in the company's own industry
+(`industry_medians.revenue_growth_2y_pct`). *Evidence:* one `sql_query` aggregation, with the
+comparison done in Python. I use the industry median rather than a fixed percentage because a
+good growth rate in food ingredients is not a good growth rate in semiconductor equipment.
+
+**Point 2 - New products as current lines mature.** Fisher wants "a determination to continue
+to develop products or processes that will still further increase total sales potentials when
+the growth potentials of currently attractive product lines have largely been exploited". It
+pairs naturally with point 1: growth today can come from old products, but Fisher is buying the
+next line as well. *Rule:* PASS when the share of FY2025 revenue that comes from products
+launched on or after 1 January 2023 is at least the industry median
+(`industry_medians.new_product_share_pct`). A company at or above its industry is already
+selling the replacement generation, not only talking about it. *Evidence:* `orders` joined to
+`products`, aggregated in SQL; the comparison is in Python.
+
+**Point 7 - Labour and personnel relations.** Fisher calls this "outstanding labor and personnel
+relations", and it is the point that cannot be settled from a database: it is exactly what his
+scuttlebutt method sends an investor to find out by talking to employees. *Rule:* PASS when the
+working-conditions interview is clearly favourable (fair pay, low turnover, people stay for
+years, problems get fixed, good morale); FAIL when it is clearly unfavourable (high turnover,
+constant overtime, low morale, strike threats, unfair pay). *Evidence:* `interview` with a
+`current_employee` on `working_conditions`, falling back to a `former_employee` only if the
+first gives a non-answer. One interview per company, well inside the limit of ten.
+
+For the two quantitative points the evidence sits far from the line on the public companies (the
+smallest gap is about 3 percentage points), and the interview answers are equally clear-cut,
+which is what Fisher-style judgement should look like: a clear call, not a coin flip at the
+threshold.
 
 ### Design
-> a visualization of your agent design and one paragraph describing it.
+
+```mermaid
+flowchart TD
+    A[Company folder] --> R{Point router}
+    R -->|Point 1| S1[sql_query: FY2023 and FY2025 revenue<br/>+ industry median growth]
+    R -->|Point 2| S2[sql_query: FY2025 revenue from<br/>products launched since 2023<br/>+ industry median share]
+    R -->|Point 7| I1[interview: current_employee,<br/>working_conditions]
+    S1 --> C1[Python: growth &ge; median<br/>PASS / FAIL]
+    S2 --> C2[Python: new share &ge; median<br/>PASS / FAIL]
+    I1 --> J[Model judge: verdict + reason]
+    I1 --> H[Cue-word check: deterministic]
+    I1 --> RV[Model reviewer: independent<br/>second verdict]
+    J --> M{Point 7: majority of<br/>judge, reviewer, cue words}
+    H --> M
+    RV --> M
+    C1 --> F[Final verdicts + evidence]
+    C2 --> F
+    M --> F
+    F --> W[Model summary writer:<br/>explains the final verdicts]
+    W --> O[One results.csv row]
+    O --> P[Next company, four in parallel]
+```
+
+The agent is a routing-and-verification pipeline rather than a free-roaming chatbot. `build_agent()`
+creates one `ChatDeepSeek` model (`deepseek-v4-flash`, temperature 0). For each company the router
+sends points 1 and 2 to `sql_query` and point 7 to `interview`, calling the LangChain tools with
+`tool.invoke` from worker threads so that companies can run concurrently. All arithmetic - revenue
+growth, the new-product share and the comparison with the industry median - happens in SQL or
+Python; the model never does a sum in its head, which is the failure mode the assignment warns
+about. Points 1 and 2 therefore have deterministic verdicts. Point 7 is genuinely qualitative, so
+one model call judges the quote, a second call reviews it independently, and a third call writes
+the summary from the final verdicts; the point 7 verdict is the majority of the judge, the
+reviewer and a deterministic cue-word check, so one contradictory model reply cannot flip a clear
+quote, and the prose cannot disagree with the verdict it is explaining. Companies run in parallel
+under a concurrency cap, each wrapped in its own error handler, so one failed call still leaves a
+row in `results.csv`. If no API key is present the same rules fall back to a deterministic reading
+(the cue-word classifier for point 7), which keeps the pipeline runnable end to end.
 
 ### Results
-> your point score on `public_test`, the companies where your verdicts disagree with the public answers, and why.
+
+Running `python3 hw3.py --data-folder public_test` gives **60/60 correct point verdicts
+(balanced 100.0%)** on the 20 public companies: no company disagrees with the public answers, on
+any of the three points. Every company used exactly one interview.
+
+The two quantitative rules reproduce the answer key exactly. The largest risks are the closest
+calls: Hollins Group's point 1 (19.3% growth against a 16.2% median) and Granite Group's point 2
+(19.7% new-product share against a 24.2% median), which still sit on the expected side of the
+line. Point 7 is the only judgement the model makes; the public quotes are unambiguous - for
+example, "Overtime is constant and people quit every month" (Ashgrove Labs, FAIL) against "Pay is
+fair, people stay for years, and problems get fixed when we raise them" (Hollins Group, PASS).
+During testing one model reply contradicted its own summary on such a quote, which is why the
+verdict is now the majority of the judge, the reviewer and the cue-word check rather than a single
+reply. With a live key the same run makes 60/60 model calls and also scores 60/60 (balanced
+100.0%); without a key point 7 falls back to the deterministic rule, so the pipeline still
+finishes.
+

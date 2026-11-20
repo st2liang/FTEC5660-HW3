@@ -7,6 +7,8 @@ import argparse
 import asyncio
 import csv
 import json
+import os
+import re
 import sqlite3
 import threading
 import zlib
@@ -15,8 +17,17 @@ from typing import Any
 
 
 MODEL_NAME = "deepseek-v4-flash"
+# The key is never written in the code: it comes from this environment variable,
+# either exported in the shell or set in .env (see build_agent).
+API_KEY_ENV = "DEEPSEEK_API_KEY"
+API_BASE_ENV = "DEEPSEEK_API_BASE"
 INTERVIEW_LIMIT = 10
 MAX_SQL_ROWS = 50
+
+# Successful live model replies, printed at the end so a run can be checked.
+LIVE_MODEL_CALLS = 0
+LIVE_MODEL_ATTEMPTS = 0
+_ERRORS_REPORTED = 0
 
 # Philip Fisher, "Common Stocks and Uncommon Profits", Part One, Chapter 3.
 # For every point, PASS means the company looks good on it. You choose 3
@@ -57,60 +68,499 @@ def load_env_file(path: Path = Path(".env")) -> None:
 
 # Choose any 3 of the 15 points, e.g. CHOSEN_POINTS = [1, 7, 15]. Your agent
 # gives a PASS or FAIL verdict on these 3 points only, with your own rule for each.
-CHOSEN_POINTS: list[int] = []  ### YOUR CODE HERE
+CHOSEN_POINTS: list[int] = [1, 2, 7]
+
+# ---------------------------------------------------------------------------
+# My rules (see the report in README.md).
+#
+# 1  Market potential: PASS when FY2025 revenue grew, from FY2023 to FY2025,
+#    by at least the median firm in the company's own industry.
+# 2  New products: PASS when the share of FY2025 revenue that comes from
+#    products launched on or after 2023-01-01 is at least the industry median.
+# 7  Labour relations: PASS when the working-conditions interview is clearly
+#    favourable (fair pay, low turnover, problems fixed, good morale); FAIL
+#    when it is clearly unfavourable (turnover, constant overtime, low morale,
+#    strike threats).
+#
+# Arithmetic is done in SQL or Python, never in the model's head.
+# ---------------------------------------------------------------------------
+
+POINT_RULES: dict[int, str] = {
+    1: (
+        "PASS if FY2025 revenue (the sum of order amounts in 2025) grew from FY2023 to FY2025 "
+        "by at least the industry median revenue_growth_2y_pct; otherwise FAIL."
+    ),
+    2: (
+        "PASS if the share of FY2025 revenue that comes from products launched on or after "
+        "2023-01-01 is at least the industry median new_product_share_pct; otherwise FAIL."
+    ),
+    7: (
+        "PASS if the working-conditions interview is clearly favourable: fair pay, low turnover, "
+        "people stay for years, problems get fixed, good morale. FAIL if it is clearly "
+        "unfavourable: high turnover, constant overtime, low morale, strike threats, unfair pay. "
+        "A non-answer is not evidence."
+    ),
+}
+
+# Point 1: growth from FY2023 to FY2025 next to the industry median.
+SQL_POINT_1 = """
+SELECT c.name AS company_name,
+       c.industry AS industry,
+       ROUND(SUM(CASE WHEN substr(o.order_date, 1, 4) = '2025' THEN o.amount ELSE 0 END) * 100.0
+             / SUM(CASE WHEN substr(o.order_date, 1, 4) = '2023' THEN o.amount ELSE 0 END) - 100, 2)
+             AS company_growth_pct,
+       m.revenue_growth_2y_pct AS industry_median_growth_pct
+FROM orders AS o
+CROSS JOIN company AS c
+CROSS JOIN industry_medians AS m
+WHERE m.industry = c.industry
+  AND substr(o.order_date, 1, 4) IN ('2023', '2025')
+GROUP BY c.name, c.industry, m.revenue_growth_2y_pct
+"""
+
+# Point 2: share of FY2025 revenue from products launched in 2023 or later.
+SQL_POINT_2 = """
+SELECT ROUND(SUM(CASE WHEN p.launch_date >= '2023-01-01' THEN o.amount ELSE 0 END) * 100.0
+             / SUM(o.amount), 2) AS company_new_product_share_pct,
+       m.new_product_share_pct AS industry_median_new_product_share_pct
+FROM orders AS o
+JOIN products AS p ON p.product = o.product
+CROSS JOIN company AS c
+CROSS JOIN industry_medians AS m
+WHERE m.industry = c.industry
+  AND substr(o.order_date, 1, 4) = '2025'
+"""
+
+# Point 7: who to ask, in order. Both roles know about working conditions; the
+# second is a fallback in case the first gives a non-answer.
+LABOUR_ROLES = ("current_employee", "former_employee")
+
+# How many companies to analyse at the same time (each uses several model calls).
+MAX_COMPANIES_IN_FLIGHT = 4
+
+JUDGE_SYSTEM_PROMPT = (
+    "You are a careful equity analyst using Philip Fisher's scuttlebutt method. "
+    "You judge exactly one question from one interview quote. Use only the quote; ignore the "
+    "company name and outside knowledge. "
+    "A favourable answer describes fair pay, low turnover, people staying for years, problems "
+    "being fixed or good morale -> PASS. An unfavourable answer describes high turnover, people "
+    "quitting often, constant overtime, low morale, strike threats or unfair pay -> FAIL. A "
+    "non-answer (\"I can't comment\", \"I only see the sales team\") is not evidence. "
+    "Examples: \"Pay is fair, people stay for years, and problems get fixed\" -> PASS. "
+    "\"Overtime is constant and people quit every month\" -> FAIL. "
+    "\"Turnover was terrible; we trained new people every month\" -> FAIL. "
+    "\"It is a good place to work; hardly anyone in my team has left\" -> PASS. "
+    "Answer with a JSON object only: {\"verdict\": \"PASS\" or \"FAIL\", \"reason\": \"one sentence\"}."
+)
+
+REVIEW_SYSTEM_PROMPT = (
+    "You are the independent reviewer in a Fisher-style research pipeline. Re-read the interview "
+    "quote against the rule and decide point 7 on your own. Keep the draft verdict if it fits the "
+    "quote; overturn it only when the quote clearly points the other way. Use only the quote. "
+    "Answer with a JSON object only: {\"point7\": \"PASS\" or \"FAIL\", \"reason\": \"one sentence\"}."
+)
+
+SUMMARY_SYSTEM_PROMPT = (
+    "You write the final research note for one company. The three verdicts are already decided "
+    "and are binding: never change or contradict them. Write two or three plain sentences that "
+    "explain point 1 with its growth rate and industry median, point 2 with its new-product share "
+    "and median, and point 7 with the interview quote. No headings, no JSON, no bullet points."
+)
 
 
-def build_agent() -> Any:
-    """Create and return your model or agent once.
+def _parse_sql_table(text: str) -> list[dict[str, str]]:
+    """Turn the sql_query pipe table into a list of row dictionaries."""
+    if not text or text.startswith("SQL error"):
+        return []
+    lines = [line for line in str(text).splitlines() if line.strip()]
+    if len(lines) < 2:
+        return []
+    header = [cell.strip() for cell in lines[0].split("|")]
+    rows: list[dict[str, str]] = []
+    for line in lines[1:]:
+        if line.startswith("...") or line.startswith("(no rows"):
+            continue
+        cells = [cell.strip() for cell in line.split("|")]
+        if len(cells) != len(header):
+            continue
+        rows.append(dict(zip(header, cells)))
+    return rows
 
-    Suggested imports:
-        from langchain_deepseek import ChatDeepSeek
-        from langchain.agents import create_agent
 
-    Use the DeepSeek model named by ``MODEL_NAME``. The API key is loaded
-    from .env. Each company has its own tools (see ``analyze_companies``), so
-    you will probably create one tool-calling agent per company there.
-    """
-    ### YOUR CODE HERE
+def _to_float(value: Any) -> float | None:
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+async def _tool_call(tool: Any, **kwargs: Any) -> str:
+    """Invoke one LangChain tool without blocking the event loop."""
+    result = await asyncio.to_thread(tool.invoke, kwargs)
+    return str(getattr(result, "content", result))
+
+
+def _is_non_answer(text: str) -> bool:
+    """True when an interview answer says the person cannot comment."""
+    lowered = text.lower()
+    markers = (
+        "can't comment", "cannot comment", "can't say", "cannot say", "couldn't say",
+        "don't see", "do not see", "only see", "never dealt with", "not my area",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+async def _working_conditions_quote(tools: dict[str, Any]) -> tuple[str, str]:
+    """Spend one interview (two at most) on Fisher's point 7."""
+    quote, role = "", LABOUR_ROLES[0]
+    for role in LABOUR_ROLES:
+        quote = await _tool_call(tools["interview"], role=role, topic="working_conditions")
+        if not _is_non_answer(quote):
+            break
+    return quote, role
+
+
+async def _gather_evidence(tools: dict[str, Any]) -> dict[str, Any]:
+    """Route each point to the right source: SQL for points 1 and 2, interviews for 7."""
+    p1_rows = _parse_sql_table(await _tool_call(tools["sql_query"], query=SQL_POINT_1))
+    p2_rows = _parse_sql_table(await _tool_call(tools["sql_query"], query=SQL_POINT_2))
+    quote, role = await _working_conditions_quote(tools)
+
+    p1 = p1_rows[0] if p1_rows else {}
+    p2 = p2_rows[0] if p2_rows else {}
+    return {
+        "company_name": p1.get("company_name", ""),
+        "industry": p1.get("industry", ""),
+        "growth_pct": _to_float(p1.get("company_growth_pct")),
+        "median_growth_pct": _to_float(p1.get("industry_median_growth_pct")),
+        "new_share_pct": _to_float(p2.get("company_new_product_share_pct")),
+        "median_new_share_pct": _to_float(p2.get("industry_median_new_product_share_pct")),
+        "labour_quote": quote,
+        "labour_role": role,
+    }
+
+
+def _threshold_verdict(value: float | None, median: float | None) -> str:
+    """Apply a 'at least the industry median' rule; missing evidence fails."""
+    if value is None or median is None:
+        return "FAIL"
+    return "PASS" if value >= median else "FAIL"
+
+
+def _labour_heuristic_verdict(quote: str) -> str:
+    """Offline fallback for point 7, used only when no model is available."""
+    if _is_non_answer(quote):
+        return "FAIL"  # no positive evidence
+    text = quote.lower()
+    negative = (
+        "quit", "left because", "turnover was terrible", "high turnover", "overtime",
+        "strike", "morale is low", "unhappy", "underpaid", "exhaust", "stress",
+        "layoff", "no training", "low pay",
+    )
+    positive = (
+        "good place", "stay for years", "fair", "treated workers well", "hardly anyone",
+        "very low", "morale is high", "good pay", "recommend", "training were good", "happy",
+    )
+    negatives = sum(cue in text for cue in negative)
+    positives = sum(cue in text for cue in positive)
+    return "FAIL" if negatives > positives else "PASS"
+
+
+def _json_object(text: str) -> dict[str, Any]:
+    """Read the first JSON object in a model reply, tolerating code fences."""
+    stripped = text.strip()
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, re.S)
+    if fenced:
+        stripped = fenced.group(1)
+    start, end = stripped.find("{"), stripped.rfind("}")
+    if start == -1 or end <= start:
+        return {}
+    try:
+        value = json.loads(stripped[start : end + 1])
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _verdict(value: Any) -> str | None:
+    text = str(value).strip().upper()
+    return text if text in VERDICTS else None
+
+
+def _dotenv_value(key: str, path: Path = Path(".env")) -> str | None:
+    """Read one KEY=VALUE from .env without touching os.environ."""
+    if not path.is_file():
+        return None
+    value = None
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, candidate = line.split("=", 1)
+        if name.strip() == key:
+            value = candidate.strip().strip("\"'")
+    return value or None
+
+
+def _mask_key(text: str) -> str:
+    key = os.environ.get(API_KEY_ENV) or ""
+    return text.replace(key, "<key>") if key else text
+
+
+def _report_model_failure(context: str, exc: Exception) -> None:
+    """Print the first few model errors instead of hiding them behind the fallback."""
+    global _ERRORS_REPORTED
+    _ERRORS_REPORTED += 1
+    if _ERRORS_REPORTED > 3 and os.environ.get("HW3_DEBUG") != "1":
+        return
+    message = _mask_key(f"{type(exc).__name__}: {exc}")
+    cause = exc.__cause__ or exc.__context__
+    if cause is not None and str(cause) and str(cause) != str(exc):
+        message += _mask_key(f" | cause: {type(cause).__name__}: {cause}")
+    print(f"Model call failed [{context}]: {message[:800]}")
+    if _ERRORS_REPORTED == 1:
+        print(
+            "  Hints: 401 = bad or expired key; 400 or 'model not found' = wrong model name; "
+            "402/429 = billing or rate limit; connection/TLS = network, proxy or certificates. "
+            "Set HW3_DEBUG=1 to print every error."
+        )
+        if "takes no keyword arguments" in message:
+            print(
+                "  This is the old brotli + httpx2 decoder bug. The agent already forces gzip; "
+                "if it persists run: pip install -U \"httpx2>=2.16\"."
+            )
+
+
+async def _model_text(model: Any, system_prompt: str, user_prompt: str) -> str:
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    global LIVE_MODEL_CALLS, LIVE_MODEL_ATTEMPTS
+    LIVE_MODEL_ATTEMPTS += 1
+    response = await model.ainvoke(
+        [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+    )
+    LIVE_MODEL_CALLS += 1
+    content = getattr(response, "content", response)
+    if isinstance(content, list):
+        content = " ".join(
+            str(part.get("text", "")) if isinstance(part, dict) else str(part) for part in content
+        )
+    return str(content).strip()
+
+
+def _evidence_block(evidence: dict[str, Any]) -> str:
+    growth = evidence.get("growth_pct")
+    median_growth = evidence.get("median_growth_pct")
+    new_share = evidence.get("new_share_pct")
+    median_new = evidence.get("median_new_share_pct")
+    return (
+        f"Company: {evidence.get('company_name') or 'unknown'} "
+        f"(industry: {evidence.get('industry') or 'unknown'}).\n"
+        f"Point 1 - FY2023 to FY2025 revenue growth: {growth}%; "
+        f"industry median revenue_growth_2y_pct: {median_growth}%.\n"
+        f"Point 2 - share of FY2025 revenue from products launched since 2023-01-01: "
+        f"{new_share}%; industry median new_product_share_pct: {median_new}%.\n"
+        f"Point 7 - interview ({evidence.get('labour_role')}): {evidence.get('labour_quote')}\n"
+    )
+
+
+def _lookup(data: dict[str, Any], *names: str) -> Any:
+    """Read a JSON field while tolerating case, spaces and underscores in its name."""
+    wanted = {name.lower().replace("_", "").replace(" ", "") for name in names}
+    for key, value in data.items():
+        if str(key).lower().replace("_", "").replace(" ", "") in wanted:
+            return value
     return None
 
 
-async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
-    """Run your agent and return its verdicts on CHOSEN_POINTS for every company.
+async def _judge_labour(model: Any, evidence: dict[str, Any]) -> str:
+    """Model verdict for the qualitative point 7."""
+    quote = evidence.get("labour_quote", "")
+    if _is_non_answer(quote):
+        return "FAIL"  # nobody who knows the topic gave evidence
+    if model is None:
+        return _labour_heuristic_verdict(quote)
+    user_prompt = (
+        f"Fisher's point 7: {FISHER_POINTS[7]}\n"
+        f"My rule: {POINT_RULES[7]}\n"
+        f"Interview quote: {quote}\n"
+        "Give the verdict and one sentence of reasoning as JSON."
+    )
+    try:
+        reply = await _model_text(model, JUDGE_SYSTEM_PROMPT, user_prompt)
+        return _verdict(_lookup(_json_object(reply), "verdict")) or _labour_heuristic_verdict(quote)
+    except Exception as exc:
+        _report_model_failure("point 7 judge", exc)
+        return _labour_heuristic_verdict(quote)
 
-    ``companies`` maps each company folder name to its four LangChain tools:
 
-        list_documents()             names and dates of the company's documents
-        read_document(name)          the text of one document
-        sql_query(query)             one read-only SQLite query on company.db
-        interview(role, topic)       one interview answer (INTERVIEW_LIMIT per company)
+async def _review_labour(model: Any, evidence: dict[str, Any], draft: str) -> str | None:
+    """Independent second opinion on point 7; None means the reviewer could not answer."""
+    if model is None:
+        return None
+    user_prompt = (
+        f"{_evidence_block(evidence)}\n"
+        f"My rule: {POINT_RULES[7]}\n"
+        f"Draft verdict: {draft}\n"
+        "Check the quote and return JSON with point7."
+    )
+    try:
+        reply = await _model_text(model, REVIEW_SYSTEM_PROMPT, user_prompt)
+        return _verdict(_lookup(_json_object(reply), "point7", "verdict"))
+    except Exception as exc:
+        _report_model_failure("point 7 review", exc)
+        return None
 
-    Give the tools to a tool-calling agent, e.g.
-    ``create_agent(model, tools=companies[name], system_prompt=...)``, or call
-    them yourself with ``tool.invoke({...})``. The README explains the
-    documents, the database tables and the interview roles and topics.
 
-    Return one dictionary per company folder name, e.g. with
-    CHOSEN_POINTS = [1, 7, 15]:
+def _combine_labour_verdicts(judge: str, reviewer: str | None, heuristic: str) -> str:
+    """Majority of the judge, the independent reviewer and the cue-word check.
 
-        {
-            "hollins_group": {
-                "points": {1: "PASS", 7: "FAIL", 15: "PASS"},
-                "summary": "Two or three sentences explaining the verdicts.",
-            },
-            ...
-        }
-
-    Each chosen point needs a verdict ("PASS" or "FAIL"; True/False also
-    works). Other points are ignored.
-
-    Catch errors per company (e.g. a failed API call) and still return an
-    entry for it: an exception here means no results.csv, which scores zero.
-    You may analyse companies in parallel (e.g. ``asyncio.gather``).
+    A single bad model reply can no longer flip a clear quote: the other two
+    signals outvote it. Ties cannot occur with three PASS/FAIL votes.
     """
-    ### YOUR CODE HERE
-    _ = agent
-    return {name: {"points": {}, "summary": ""} for name in companies}
+    votes = [judge, reviewer, heuristic]
+    votes = [vote for vote in votes if vote in VERDICTS]
+    for candidate in (judge, reviewer):
+        if candidate in VERDICTS and votes.count(candidate) >= 2:
+            return candidate
+    return votes[0] if votes else "FAIL"
+
+
+def _fallback_summary(evidence: dict[str, Any], points: dict[int, str]) -> str:
+    name = evidence.get("company_name") or "The company"
+    quote = evidence.get("labour_quote") or "no interview answer"
+    return (
+        f"{name} grew revenue from FY2023 to FY2025 by {evidence.get('growth_pct')}% against an "
+        f"industry median of {evidence.get('median_growth_pct')}% (point 1: {points.get(1)}). "
+        f"Products launched since 2023 provided {evidence.get('new_share_pct')}% of FY2025 revenue "
+        f"against a median of {evidence.get('median_new_share_pct')}% (point 2: {points.get(2)}). "
+        f"On working conditions a {str(evidence.get('labour_role', 'staff')).replace('_', ' ')} "
+        f"said: {quote} (point 7: {points.get(7)})."
+    )
+
+
+async def _write_summary(model: Any, evidence: dict[str, Any], points: dict[int, str]) -> str:
+    """Write the note from the final verdicts so prose cannot contradict them."""
+    fallback = _fallback_summary(evidence, points)
+    if model is None:
+        return fallback
+    user_prompt = (
+        f"{_evidence_block(evidence)}\n"
+        f"Final verdicts: point 1 {points[1]}, point 2 {points[2]}, point 7 {points[7]}.\n"
+        "Write two or three sentences explaining these verdicts."
+    )
+    try:
+        text = await _model_text(model, SUMMARY_SYSTEM_PROMPT, user_prompt)
+        return text.strip() or fallback
+    except Exception as exc:
+        _report_model_failure("summary", exc)
+        return fallback
+
+
+async def _analyze_company(
+    model: Any, folder_name: str, tools: list[Any]
+) -> dict[str, Any]:
+    tools_by_name = {getattr(tool, "name", str(index)): tool for index, tool in enumerate(tools)}
+    evidence = await _gather_evidence(tools_by_name)
+    quote = evidence.get("labour_quote", "")
+
+    judge = await _judge_labour(model, evidence)
+    reviewer = await _review_labour(model, evidence, judge)
+    points = {
+        1: _threshold_verdict(evidence["growth_pct"], evidence["median_growth_pct"]),
+        2: _threshold_verdict(evidence["new_share_pct"], evidence["median_new_share_pct"]),
+        7: _combine_labour_verdicts(judge, reviewer, _labour_heuristic_verdict(quote)),
+    }
+    summary = await _write_summary(model, evidence, points)
+    if not evidence.get("company_name"):
+        summary = f"{folder_name}: {summary}"
+    return {"points": points, "summary": summary}
+
+
+def build_agent() -> Any:
+    """Create the DeepSeek chat model once.
+
+    The key is read from ``KEY=VALUE`` lines in ``.env`` (gitignored) or from the
+    ``DEEPSEEK_API_KEY`` environment variable; when both exist and differ the
+    ``.env`` value wins, so a stale export cannot shadow the key you just saved.
+    It is never read from the source code. ``DEEPSEEK_API_BASE`` is optional and
+    lets you point at a different endpoint. Without a key the pipeline still runs
+    with the deterministic fallback, so check the printed mode line below.
+    """
+    load_env_file()
+    dotenv_key = _dotenv_value(API_KEY_ENV)
+    exported_key = os.environ.get(API_KEY_ENV)
+    if dotenv_key:
+        if exported_key and exported_key != dotenv_key:
+            print(
+                f"Note: {API_KEY_ENV} in .env differs from the one exported in the shell; "
+                "using the .env value."
+            )
+        os.environ[API_KEY_ENV] = dotenv_key
+        key_source = ".env"
+    elif exported_key:
+        key_source = "the environment"
+    else:
+        print(f"Agent mode: deterministic fallback ({API_KEY_ENV} is not set).")
+        return {"model": None}
+
+    try:
+        from langchain_deepseek import ChatDeepSeek
+
+        model = ChatDeepSeek(
+            model=MODEL_NAME,
+            temperature=0,
+            max_retries=2,
+            timeout=45,
+            # Some environments ship an old `brotli` whose Decompressor.process()
+            # rejects the keyword that httpx2 passes it, which crashes every call
+            # with "process() takes no keyword arguments". Asking for gzip/deflate
+            # keeps the Brotli decoder out of the path on old and new versions.
+            default_headers={"Accept-Encoding": "gzip, deflate"},
+        )
+    except Exception as exc:
+        print(f"Agent mode: deterministic fallback (could not create {MODEL_NAME}: {exc}).")
+        return {"model": None}
+
+    base = os.environ.get(API_BASE_ENV) or "https://api.deepseek.com/v1"
+    print(f"Agent mode: live {MODEL_NAME} at {base} ({API_KEY_ENV} from {key_source}).")
+    return {"model": model}
+
+
+async def analyze_companies(agent: Any, companies: dict[str, list[Any]]) -> dict[str, dict[str, Any]]:
+    """Run the per-company pipeline (routing, judging, reflection) with a concurrency cap."""
+    global LIVE_MODEL_CALLS, LIVE_MODEL_ATTEMPTS, _ERRORS_REPORTED
+    LIVE_MODEL_CALLS = 0
+    LIVE_MODEL_ATTEMPTS = 0
+    _ERRORS_REPORTED = 0
+    if isinstance(agent, dict):
+        model = agent.get("model")
+    else:
+        model = getattr(agent, "model", None)
+    semaphore = asyncio.Semaphore(MAX_COMPANIES_IN_FLIGHT)
+
+    async def run_one(name: str, tools: list[Any]) -> tuple[str, dict[str, Any]]:
+        async with semaphore:
+            try:
+                return name, await _analyze_company(model, name, tools)
+            except Exception as exc:  # one bad company must not kill the run
+                return name, {
+                    "points": {point: "FAIL" for point in CHOSEN_POINTS},
+                    "summary": f"Analysis failed for {name}: {exc}",
+                }
+
+    pairs = await asyncio.gather(*(run_one(name, tools) for name, tools in companies.items()))
+    if model is not None:
+        print(
+            f"Live model calls: {LIVE_MODEL_CALLS}/{LIVE_MODEL_ATTEMPTS} succeeded "
+            "(a working key should give about 3 per company)."
+        )
+        if LIVE_MODEL_CALLS == 0:
+            print(
+                "WARNING: no model call succeeded, so the results above come from the "
+                "deterministic fallback; fix the error printed above and rerun."
+            )
+    return dict(pairs)
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
